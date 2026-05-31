@@ -35,12 +35,14 @@ CONFIG_FILES = [
     ".env",
     "auth.json",
     "channel_directory.json",
+    "SOUL.md",
 ]
 
 CONFIG_DIRS = [
     "skills",
     "memories",
     "cron",
+    "plugins",
 ]
 
 # Files/dirs we explicitly exclude from skills/
@@ -89,6 +91,8 @@ TOP_LEVEL_EXCLUDE = {
     "kanban.db-shm",
     "kanban.db-wal",
     "shell-hooks-allowlist.json",
+    "auth.lock",
+    "state-snapshots",
     "config.yaml.bak." + "*",   # backup configs
     ".env.bak." + "*",
 }
