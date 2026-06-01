@@ -1368,11 +1368,22 @@ def _check_hermes_installed(host: str) -> bool:
             return True
         return False
     else:
-        # Remote check via SSH — use interactive mode so password
-        # prompts pass through to the user. Returncode 0 means the
-        # check command succeeded (hermes found on PATH or ~/.hermes exists).
-        result = _ssh_run(host, "which hermes || test -d ~/.hermes", timeout=15, capture=False)
-        return result.returncode == 0
+        # Remote check via SSH — use raw subprocess instead of _ssh_run
+        # because _ssh_run calls sys.exit(1) on non-zero returncode, but
+        # here non-zero is a valid answer ("Hermes not installed").
+        ssh_args = _ssh_base_args(host) + [host, "which hermes || test -d ~/.hermes"]
+        try:
+            result = subprocess.run(
+                ["ssh"] + ssh_args,
+                timeout=15,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            print(f"ERROR: SSH check timed out connecting to {host}")
+            sys.exit(1)
+        except FileNotFoundError:
+            print("ERROR: 'ssh' command not found. Is OpenSSH client installed?")
+            sys.exit(1)
 
 
 def _install_hermes(host: str, auto_install: bool = False) -> bool:
