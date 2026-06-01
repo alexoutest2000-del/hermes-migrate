@@ -14,17 +14,18 @@ Usage:
 """
 
 import argparse
+import fnmatch
 import io
 import json
 import os
 import re
-import shutil
 import sys
 import tarfile
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+__version__ = "1.1.0"
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -391,7 +392,6 @@ def _add_dir_contents(
             # Also check glob-style wildcard patterns (e.g., "*.bak.*")
             for exc in excludes:
                 if "*" in exc:
-                    import fnmatch
                     if fnmatch.fnmatch(part, exc):
                         skip = True
                         break
@@ -457,7 +457,6 @@ def _should_exclude_top_level(name: str) -> bool:
 
     Returns True if the entry should be EXCLUDED.
     """
-    import fnmatch
     for pattern in TOP_LEVEL_EXCLUDE:
         if fnmatch.fnmatch(name, pattern):
             return True
@@ -584,7 +583,7 @@ def import_config(
     print(f"Target home: {hermes_home}")
     print(f"Mode:        {'dry-run' if dry_run else 'live'}{' (force)' if force else ''}")
 
-    with tarfile.open(archive_path, "r:gz") as tar:
+    with _open_archive(archive_path) as tar:
         members = tar.getmembers()
 
         # ── Phase 1: Read the embedded manifest ──────────────────────────
@@ -715,7 +714,7 @@ def list_archive(archive_path: str) -> None:
         print(f"ERROR: Archive not found: {archive_path}")
         sys.exit(1)
 
-    with tarfile.open(archive_path, "r:gz") as tar:
+    with _open_archive(archive_path) as tar:
         members = tar.getmembers()
 
         # Display the embedded manifest first (source host, date, etc.)
@@ -769,7 +768,7 @@ def diff_archive(archive_path: str, target_home: Optional[str] = None) -> None:
     print(f"Comparing archive {archive_path.name}")
     print(f"  against {hermes_home}\n")
 
-    with tarfile.open(archive_path, "r:gz") as tar:
+    with _open_archive(archive_path) as tar:
         # Only compare regular files (skip directories and the manifest)
         members = [m for m in tar.getmembers()
                    if m.isfile() and m.name != ".hermes-migrate-manifest.json"]
@@ -777,7 +776,6 @@ def diff_archive(archive_path: str, target_home: Optional[str] = None) -> None:
         new_files = []       # In archive but not on target
         different = []       # On both sides but content differs
         identical = []       # Byte-for-byte identical
-        missing_target = []  # (reserved — unused, kept for symmetry)
 
         for m in members:
             # Resolve target path using the same logic as import_config
@@ -808,15 +806,6 @@ def diff_archive(archive_path: str, target_home: Optional[str] = None) -> None:
                     different.append(f"{target_path} (size differs)")
                 else:
                     identical.append(str(target_path))
-
-        # Collect the set of archive paths for comparison
-        # (currently only computed; the "missing from archive" report is reserved)
-        archive_files = set()
-        for m in members:
-            parts = Path(m.name).parts
-            if parts[0] == ".hermes":
-                rel = str(Path(*parts[1:])) if len(parts) > 1 else "."
-                archive_files.add(rel)
 
     # ── Summary output ──────────────────────────────────────────────────
     print(f"  New (would be created):     {len(new_files)}")
@@ -853,6 +842,21 @@ def _human_size(size: int) -> str:
     return f"{size:.1f} TB"
 
 
+def _open_archive(archive_path: Path) -> tarfile.TarFile:
+    """Open a tar.gz archive with graceful error handling.
+
+    Wraps tarfile.open() to catch ReadError (corrupt archive, wrong format,
+    truncated file) and exit with a clear error message instead of a traceback.
+    """
+    try:
+        return tarfile.open(archive_path, "r:gz")
+    except tarfile.ReadError as e:
+        print(f"ERROR: Cannot read archive: {archive_path}")
+        print(f"  {e}")
+        print("  The file may be corrupt, not a valid tar.gz, or truncated.")
+        sys.exit(1)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 # Command-line interface using argparse with subcommands.
 # Each subcommand maps directly to a top-level function:
@@ -880,6 +884,9 @@ Examples:
   hermes-migrate list backup.tar.gz               # List archive contents
   hermes-migrate diff backup.tar.gz               # Compare archive vs current
         """,
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
 
     # Subcommands: each gets its own argument parser
