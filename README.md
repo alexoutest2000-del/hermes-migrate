@@ -1,9 +1,9 @@
-# Hermes Migrate
+# Hermes Migrate v1.1.0
 
 Export/import a complete Hermes Agent configuration between hosts.
 
 One command packages everything — config, API keys, skills, cron jobs, memory,
-profiles — into a portable `.tar.gz` archive. One command restores it elsewhere.
+profiles, plugins — into a portable `.tar.gz` archive. One command restores it elsewhere.
 
 ## Quick Start
 
@@ -15,6 +15,15 @@ python3 hermes_migrate.py export
 
 # Import onto another host
 python3 hermes_migrate.py import hermes-export-bot-20260531.tar.gz
+```
+
+All commands support `--help` for full option listings:
+
+```bash
+python3 hermes_migrate.py --help           # Top-level help + examples
+python3 hermes_migrate.py export --help    # Export options
+python3 hermes_migrate.py import --help    # Import options
+python3 hermes_migrate.py --version        # Print version
 ```
 
 ## Commands
@@ -39,15 +48,20 @@ Packages all Hermes configuration into a portable archive.
 - `.env` — API keys, tokens, environment variables
 - `auth.json` — OAuth tokens
 - `channel_directory.json` — messaging channel mappings
+- `SOUL.md` — agent persona / personality definition
 - `skills/` — all bundled + custom skills (excluding runtime state)
-- `cron/jobs.json` — scheduled jobs
+- `cron/` — scheduled job definitions (excluding run output)
 - `memories/` — persistent memory (MEMORY.md, USER.md)
-- `profiles/` — all named profiles with their config, skills, cron, memories
+- `plugins/` — third-party and custom plugins
+- `profiles/` — all named profiles with their own config, skills, cron, memories, plugins
 
 **What's intentionally excluded:**
-- Sessions, state.db, logs, caches, sandboxes
-- Background process state, gateway PID/lock files
-- Cron output logs, curator backups, usage tracking
+- Session history, state databases (state.db, kanban.db), WAL journals
+- Logs, shell history, caches (audio, image, model lists)
+- Gateway runtime state (PID, lock files, gateway_state.json)
+- Background process tracking, auth locks, shell hook approvals
+- Sandboxes, checkpoints, LSP binaries, the Hermes installation itself
+- Device pairing data, Git hooks, cron output logs, curator state
 
 ### import
 
@@ -74,7 +88,9 @@ After import, follow the printed next steps to verify the restored config.
 python3 hermes_migrate.py list ARCHIVE
 ```
 
-Shows the manifest (export metadata) and all file entries with sizes.
+Shows the export manifest (hostname, date, redaction status) and all file
+entries with type indicators and sizes. Use this to inspect an archive before
+importing.
 
 ### diff
 
@@ -86,6 +102,8 @@ Compares an export archive against a target Hermes home. Reports:
 - New files (would be created)
 - Different files (would be overwritten)
 - Identical files (no change)
+
+Files >1MB are compared by size only to keep the operation fast.
 
 ## Security
 
@@ -101,17 +119,19 @@ secure locations:
 python3 hermes_migrate.py export --redact-secrets
 ```
 
-The redaction heuristic replaces values that look like API keys, JWTs, and
-long random strings with `[REDACTED]`. Short numeric config values (timeouts,
-port numbers) are preserved. Docker image names and similar technical strings
-may also be caught — you'll need to restore those manually on import.
+The redaction heuristic replaces values that look like API keys (sk-*, hf_*,
+ghp_*, etc.), JWTs, and long random-looking strings with `[REDACTED]`. Short
+numeric config values (timeouts, port numbers) are preserved.
 
 ### After importing redacted exports
 
-You'll need to re-authenticate providers:
+You'll need to fill in secrets manually:
+
 ```bash
-hermes auth add <provider>     # OAuth providers
-# Or manually edit .env to fill in API keys
+# OAuth providers
+hermes auth add <provider>
+
+# Or edit .env directly to paste in API keys
 ```
 
 ## Example Workflow
@@ -124,9 +144,13 @@ python3 hermes_migrate.py export -o migrate.tar.gz
 scp migrate.tar.gz user@new-host:/tmp/
 
 # On new host (after installing Hermes)
-python3 hermes_migrate.py import /tmp/migrate.tar.gz --dry-run
-python3 hermes_migrate.py import /tmp/migrate.tar.gz --force
+python3 hermes_migrate.py diff /tmp/migrate.tar.gz --dry-run    # see what's there
+python3 hermes_migrate.py import /tmp/migrate.tar.gz --dry-run  # preview
+python3 hermes_migrate.py import /tmp/migrate.tar.gz --force    # apply
 hermes gateway restart
+
+# Re-authenticate OAuth providers if needed:
+hermes auth list
 ```
 
 ### Backing up before major changes
@@ -148,9 +172,26 @@ python3 hermes_migrate.py export --redact-secrets -o shared-config.tar.gz
 - Python 3.10+ (stdlib only — no pip install needed)
 - tar (available on all Linux/macOS)
 
-## Limitations
+## What Migration Does and Doesn't Transfer
 
-- Does **not** migrate: session history, log files, gateway state, sandbox
-  environments, audio/image caches, background process state
-- Import does **not** restart the gateway — you must do that manually
-- OAuth tokens in `auth.json` may need re-authentication on a new host
+### Transferred (configuration — identical behavior on new host)
+
+- Agent personality, models, providers, tools, gateway config
+- All skills, cron jobs, memories, plugins
+- Named profiles with full config
+- Messaging channel mappings
+- API keys (if export was not redacted)
+
+### NOT transferred (runtime state — must be set up manually)
+
+- **Session history** — past conversations stay on the old host
+- **OAuth tokens** — `auth.json` copies over but tokens are often
+  host-bound. Providers like Google and GitHub typically require
+  re-authentication on the new machine.
+- **Gateway** — you must restart it manually after import.
+- **Git repos** — `/home/bot/projects/` and similar directories are
+  completely outside the tool's scope. Clone or scp them separately.
+- **Shell hook approvals** — machine-specific, not portable.
+- **The Hermes installation** — binaries, venv, LSP servers. Install
+  Hermes on the target first, then import config on top.
+- **Logs, caches, sandboxes, process state** — all explicitly excluded.
