@@ -1134,18 +1134,33 @@ def _ssh_run(
         host    - Remote host (user@host or just host).
         command - Shell command to execute.
         timeout - Max seconds to wait for completion.
-        capture - If True, capture stdout/stderr. If False, let them pass through.
+        capture - If True, capture stdout/stderr with stdin closed
+                  (non-interactive, for quick checks). If False,
+                  inherit stdin/stdout/stderr so password prompts
+                  and interactive sessions work.
 
     Returns the CompletedProcess. Exits with code 1 on SSH failure.
     """
     ssh_args = _ssh_base_args(host) + [host, command]
     try:
-        result = subprocess.run(
-            ["ssh"] + ssh_args,
-            capture_output=capture,
-            text=True,
-            timeout=timeout,
-        )
+        if capture:
+            # Non-interactive: close stdin so we don't hang waiting for
+            # password prompts that can never be answered.
+            result = subprocess.run(
+                ["ssh"] + ssh_args,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            # Interactive: inherit terminal so password prompts,
+            # host key confirmations, etc. pass through to the user.
+            result = subprocess.run(
+                ["ssh"] + ssh_args,
+                text=True,
+                timeout=timeout,
+            )
         if result.returncode != 0:
             print(f"ERROR: SSH command failed on {host}")
             print(f"  Command: {command}")
@@ -1285,7 +1300,7 @@ def _remote_export(
     cmd = " ".join(cmd_parts)
 
     print(f"\n  Exporting from {host}...")
-    _ssh_run(host, cmd, timeout=120)
+    _ssh_run(host, cmd, timeout=120, capture=False)
     print(f"  Export complete on {host}")
 
 
@@ -1306,20 +1321,29 @@ def _remote_import(
         cmd_parts.append(f"--target-home {target_home}")
     cmd = " ".join(cmd_parts)
     print(f"\n  Importing on {host}...")
-    _ssh_run(host, cmd, timeout=120)
+    _ssh_run(host, cmd, timeout=120, capture=False)
     print(f"  Import complete on {host}")
 
 
 def _remote_cleanup(host: str, *paths: str) -> None:
-    """Remove temp files on a remote host via SSH."""
+    """Remove temp files on a remote host via SSH.
+
+    Cleanup failures are non-fatal — the user can manually remove
+    /tmp/hermes-migrate-*.tar.gz if needed.
+    """
     if not paths:
         return
     cmd = f"rm -f {' '.join(paths)}"
+    ssh_args = _ssh_base_args(host) + [host, cmd]
     try:
-        _ssh_run(host, cmd, timeout=10)
-    except SystemExit:
-        # Cleanup failures are non-fatal — just warn
-        print(f"  (warning: cleanup on {host} failed, temp files may remain)")
+        subprocess.run(
+            ["ssh"] + ssh_args,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except Exception:
+        print(f"  (note: temp files on {host} were not cleaned up — remove manually if desired)")
 
 
 def _check_hermes_installed(host: str) -> bool:
@@ -1344,9 +1368,11 @@ def _check_hermes_installed(host: str) -> bool:
             return True
         return False
     else:
-        # Remote check via SSH
-        result = _ssh_run(host, "which hermes || test -d ~/.hermes && echo found", timeout=10)
-        return result.returncode == 0 and result.stdout.strip() != ""
+        # Remote check via SSH — use interactive mode so password
+        # prompts pass through to the user. Returncode 0 means the
+        # check command succeeded (hermes found on PATH or ~/.hermes exists).
+        result = _ssh_run(host, "which hermes || test -d ~/.hermes", timeout=15, capture=False)
+        return result.returncode == 0
 
 
 def _install_hermes(host: str, auto_install: bool = False) -> bool:
