@@ -1,4 +1,4 @@
-# Hermes Migrate v1.1.0
+# Hermes Migrate v1.2.0
 
 Export/import a complete Hermes Agent configuration between hosts.
 
@@ -104,6 +104,46 @@ Compares an export archive against a target Hermes home. Reports:
 - Identical files (no change)
 
 Files >1MB are compared by size only to keep the operation fast.
+
+### migrate
+
+```bash
+python3 hermes_migrate.py migrate -s SOURCE -d DEST [options]
+```
+
+One-command host-to-host migration over SSH. Exports from the source, transfers
+the archive via scp, and imports on the destination. Can be run from the source,
+the destination, or a third host.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-s, --source HOST` | — | Source host (user@host). Omit if running on source. |
+| `-d, --dest HOST` | — | Destination host (user@host). Omit if running on dest. |
+| `-i, --install` | off | Auto-install Hermes on dest if missing (skip prompt) |
+| `--redact-secrets` | off | Redact API keys during transfer |
+| `--no-profiles` | off | Exclude named profiles |
+| `--target-home PATH` | `~/.hermes` | Target Hermes home on destination |
+
+If Hermes is not installed on the destination, the tool prompts to install it
+(use `-i` to auto-install without prompting). SSH key authentication is
+required — password prompts are forwarded to the terminal.
+
+```bash
+# Run from source host (only --dest needed)
+python3 hermes_migrate.py migrate -d user@new-server
+
+# Run from destination host (only --source needed)
+python3 hermes_migrate.py migrate -s user@old-server
+
+# Run from a third host (both required)
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2
+
+# Auto-install Hermes on destination if missing
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2 -i
+
+# With redacted secrets (safer over untrusted networks)
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2 --redact-secrets
+```
 
 ## Security
 

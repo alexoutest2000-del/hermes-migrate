@@ -19,13 +19,15 @@ import io
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -857,11 +859,429 @@ def _open_archive(archive_path: Path) -> tarfile.TarFile:
         sys.exit(1)
 
 
+# ── Migrate ───────────────────────────────────────────────────────────────────
+# `hermes-migrate migrate` — one-command host-to-host migration over SSH.
+#
+# The archive is created on the source, transferred to the destination via scp,
+# then imported. The tool can be run from the source, the destination, or a
+# third host. If Hermes isn't installed on the destination, it offers to install
+# it (or auto-installs with --install).
+#
+# SSH is invoked via subprocess (ssh/scp) — no external Python deps needed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+HERMES_INSTALL_CMD = (
+    "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/"
+    "main/scripts/install.sh | bash"
+)
+
+# Path where this script gets staged on remote hosts
+REMOTE_SCRIPT_PATH = "/tmp/hermes_migrate.py"
+
+
+def _is_localhost(host: str) -> bool:
+    """Check whether a host specifier refers to the local machine.
+
+    Handles: None, empty string, 'localhost', '127.0.0.1', '::1',
+    and the machine's own hostname.
+    """
+    if not host:
+        return True
+    # Strip user@ prefix if present
+    hostname = host.split("@")[-1]
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        if hostname == socket.gethostname():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ssh_base_args(host: str) -> list[str]:
+    """Build a base ssh/scp argument list with common safety options.
+
+    Disables strict host key checking (needed for first-time connections)
+    and sets a connection timeout. The host is user@host or just host.
+    """
+    return [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-o", "BatchMode=no",
+    ]
+
+
+def _ssh_run(
+    host: str,
+    command: str,
+    timeout: int = 300,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run a command on a remote host via SSH.
+
+    Parameters:
+        host    - Remote host (user@host or just host).
+        command - Shell command to execute.
+        timeout - Max seconds to wait for completion.
+        capture - If True, capture stdout/stderr. If False, let them pass through.
+
+    Returns the CompletedProcess. Exits with code 1 on SSH failure.
+    """
+    ssh_args = _ssh_base_args(host) + [host, command]
+    try:
+        result = subprocess.run(
+            ["ssh"] + ssh_args,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            print(f"ERROR: SSH command failed on {host}")
+            print(f"  Command: {command}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr.strip()}")
+            sys.exit(1)
+        return result
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: SSH command timed out after {timeout}s on {host}")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("ERROR: 'ssh' command not found. Is OpenSSH client installed?")
+        sys.exit(1)
+
+
+def _scp_transfer(
+    source: str,
+    dest: str,
+    timeout: int = 300,
+) -> None:
+    """Copy a file between hosts (or locally) via scp.
+
+    Parameters:
+        source - Source path, optionally prefixed with host: (e.g., 'host:/tmp/x.tar.gz')
+        dest   - Destination path, optionally prefixed with host:
+        timeout- Max seconds to wait.
+
+    For local transfers (no host prefix on either side), uses cp instead of scp.
+    """
+    # Check if this is a local-to-local copy
+    if ":" not in source and ":" not in dest:
+        print(f"  cp {source} → {dest}")
+        subprocess.run(["cp", source, dest], check=True, timeout=timeout)
+        return
+
+    scp_args = _ssh_base_args(source if ":" in source else dest)
+    # scp needs args before the host:path specs
+    print(f"  scp {source} → {dest}")
+    try:
+        subprocess.run(
+            ["scp"] + scp_args + [source, dest],
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: SCP transfer failed: {e}")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: SCP transfer timed out after {timeout}s")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("ERROR: 'scp' command not found. Is OpenSSH client installed?")
+        sys.exit(1)
+
+
+def _stage_script(host: str) -> None:
+    """Copy this script to a remote host's /tmp/ so it can be run there.
+
+    Skips if the host is localhost (script is already available locally).
+    The script is self-contained (stdlib only, no Python deps), so it runs
+    on any host with Python 3.10+.
+    """
+    if _is_localhost(host):
+        return
+    script_path = Path(__file__).resolve()
+    print(f"  Copying migration script to {host}...")
+    _scp_transfer(
+        str(script_path),
+        f"{host}:{REMOTE_SCRIPT_PATH}",
+        timeout=30,
+    )
+
+
+def _remote_export(
+    host: str,
+    output_path: str,
+    redact_secrets: bool = False,
+    no_profiles: bool = False,
+) -> None:
+    """Export Hermes config on a remote host by running this script via SSH.
+
+    Parameters:
+        host           - Remote host (user@host).
+        output_path    - Path ON THE REMOTE HOST for the archive.
+        redact_secrets - Pass --redact-secrets to the remote export.
+        no_profiles    - Pass --no-profiles to the remote export.
+    """
+    cmd_parts = [f"python3 {REMOTE_SCRIPT_PATH}", "export", "-o", output_path]
+    if redact_secrets:
+        cmd_parts.append("--redact-secrets")
+    if no_profiles:
+        cmd_parts.append("--no-profiles")
+    cmd = " ".join(cmd_parts)
+
+    print(f"\n  Exporting from {host}...")
+    _ssh_run(host, cmd, timeout=120)
+    print(f"  Export complete on {host}")
+
+
+def _remote_import(
+    host: str,
+    archive_path: str,
+    target_home: Optional[str] = None,
+) -> None:
+    """Import an archive on a remote host via SSH.
+
+    Parameters:
+        host         - Remote host (user@host).
+        archive_path - Path ON THE REMOTE HOST to the archive.
+        target_home  - Optional target Hermes home directory.
+    """
+    cmd_parts = [f"python3 {REMOTE_SCRIPT_PATH}", "import", archive_path, "--force"]
+    if target_home:
+        cmd_parts.append(f"--target-home {target_home}")
+    cmd = " ".join(cmd_parts)
+    print(f"\n  Importing on {host}...")
+    _ssh_run(host, cmd, timeout=120)
+    print(f"  Import complete on {host}")
+
+
+def _remote_cleanup(host: str, *paths: str) -> None:
+    """Remove temp files on a remote host via SSH."""
+    if not paths:
+        return
+    cmd = f"rm -f {' '.join(paths)}"
+    try:
+        _ssh_run(host, cmd, timeout=10)
+    except SystemExit:
+        # Cleanup failures are non-fatal — just warn
+        print(f"  (warning: cleanup on {host} failed, temp files may remain)")
+
+
+def _check_hermes_installed(host: str) -> bool:
+    """Check whether Hermes is installed on a host.
+
+    Works for both local and remote hosts. Returns True if 'hermes'
+    is found on PATH.
+    """
+    if _is_localhost(host):
+        # Local check: just look for hermes on PATH
+        try:
+            subprocess.run(
+                ["which", "hermes"],
+                capture_output=True,
+                timeout=5,
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+        # Also check if ~/.hermes exists (installed but not on PATH)
+        if (Path.home() / ".hermes").exists():
+            return True
+        return False
+    else:
+        # Remote check via SSH
+        result = _ssh_run(host, "which hermes || test -d ~/.hermes && echo found", timeout=10)
+        return result.returncode == 0 and result.stdout.strip() != ""
+
+
+def _install_hermes(host: str, auto_install: bool = False) -> bool:
+    """Install Hermes on a host if it isn't already present.
+
+    Parameters:
+        host         - Host to install on (user@host or localhost).
+        auto_install - If True, install without prompting. If False,
+                       prompt the user before proceeding.
+
+    Returns True if Hermes is now installed (or was already).
+    Exits if the user declines installation.
+    """
+    if _check_hermes_installed(host):
+        return True
+
+    label = "this machine" if _is_localhost(host) else host
+
+    if not auto_install:
+        print(f"\nHermes is not installed on {label}.")
+        response = input("Install Hermes now? [Y/n] ").strip().lower()
+        if response and response not in ("y", "yes"):
+            print("Aborting. Install Hermes on the destination first, or re-run with --install.")
+            sys.exit(1)
+
+    print(f"\nInstalling Hermes on {label}...")
+    print(f"  Running: {HERMES_INSTALL_CMD}")
+
+    if _is_localhost(host):
+        # Local install
+        try:
+            subprocess.run(
+                ["bash", "-c", HERMES_INSTALL_CMD],
+                check=True,
+                timeout=300,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: Hermes installation failed: {e}")
+            sys.exit(1)
+    else:
+        # Remote install
+        _ssh_run(host, HERMES_INSTALL_CMD, timeout=300, capture=False)
+
+    print(f"  Installation complete on {label}")
+    return True
+
+
+def migrate_config(
+    source: Optional[str] = None,
+    dest: Optional[str] = None,
+    install: bool = False,
+    redact_secrets: bool = False,
+    no_profiles: bool = False,
+    target_home: Optional[str] = None,
+) -> None:
+    """One-command migration from source host to destination host over SSH.
+
+    Can be run from the source, the destination, or a third host. The tool
+    exports Hermes config from the source, transfers the archive to the
+    destination via scp, and imports it. If Hermes is not installed on the
+    destination, it offers to install it (or auto-installs with --install).
+
+    Parameters:
+        source         - Source host (user@host or None for localhost).
+        dest           - Destination host (user@host or None for localhost).
+        install        - Auto-install Hermes on dest if missing (skip prompt).
+        redact_secrets - Redact API keys during transfer.
+        no_profiles    - Exclude named profiles from migration.
+
+    At least one of source/dest must be remote for this to be useful;
+    if both are local, falls back to a local export-then-import.
+    """
+    source = source or ""
+    dest = dest or ""
+
+    source_is_local = _is_localhost(source)
+    dest_is_local = _is_localhost(dest)
+
+    # ── Validate ─────────────────────────────────────────────────────────
+    if not source and not dest:
+        print("ERROR: At least one of --source or --dest is required.")
+        print("  For local migration, use: hermes_migrate.py export + import")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("Hermes Migration")
+    print(f"  Source:      {'localhost' if source_is_local else source}")
+    print(f"  Destination: {'localhost' if dest_is_local else dest}")
+    print(f"  Running from: {'source' if source_is_local else 'destination' if dest_is_local else 'third host'}")
+    print("=" * 60)
+
+    # ── Stage the script on remote hosts that need it ────────────────────
+    if not source_is_local:
+        _stage_script(source)
+    if not dest_is_local and dest != source:
+        _stage_script(dest)
+
+    # ── Check/install Hermes on destination ──────────────────────────────
+    if not _check_hermes_installed(dest if not dest_is_local else ""):
+        # Note: _check_hermes_installed("") checks localhost
+        target = dest if not dest_is_local else ""
+        _install_hermes(target, auto_install=install)
+
+    # ── 1. Export from source ────────────────────────────────────────────
+    # The archive is always created on the source host.
+    archive_name = f"hermes-migrate-{os.uname().nodename}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    source_archive = f"/tmp/{archive_name}"
+
+    if source_is_local:
+        print(f"\nExporting from localhost...")
+        export_config(
+            output_path=source_archive,
+            redact_secrets=redact_secrets,
+            include_profiles=not no_profiles,
+        )
+    else:
+        _remote_export(source, source_archive, redact_secrets, no_profiles)
+
+    # ── 2. Transfer archive to destination ───────────────────────────────
+    dest_archive = f"/tmp/{archive_name}"
+
+    if source_is_local and dest_is_local:
+        # Both local — archive is already in place, no transfer needed
+        # (But use the correct path: source_archive and dest_archive are the same)
+        pass
+    elif source_is_local:
+        # Source local, dest remote
+        print(f"\nTransferring archive to {dest}...")
+        _scp_transfer(source_archive, f"{dest}:{dest_archive}", timeout=120)
+    elif dest_is_local:
+        # Source remote, dest local
+        print(f"\nTransferring archive from {source}...")
+        _scp_transfer(f"{source}:{source_archive}", dest_archive, timeout=120)
+    else:
+        # Both remote (3rd host) — scp between them
+        print(f"\nTransferring archive from {source} to {dest}...")
+        _scp_transfer(
+            f"{source}:{source_archive}",
+            f"{dest}:{dest_archive}",
+            timeout=120,
+        )
+
+    # ── 3. Import on destination ─────────────────────────────────────────
+    if dest_is_local:
+        print(f"\nImporting on localhost...")
+        import_config(
+            archive_path=dest_archive,
+            force=True,
+            target_home=target_home,
+        )
+    else:
+        _remote_import(dest, dest_archive, target_home=target_home)
+
+    # ── 4. Cleanup temp files ────────────────────────────────────────────
+    print(f"\nCleaning up...")
+    if not source_is_local:
+        _remote_cleanup(source, source_archive, REMOTE_SCRIPT_PATH)
+    else:
+        # Clean local temp files
+        for p in [source_archive]:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if not dest_is_local:
+        _remote_cleanup(dest, dest_archive, REMOTE_SCRIPT_PATH)
+    else:
+        for p in [dest_archive]:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    print(f"\n{'=' * 60}")
+    print("Migration complete!")
+    print(f"  {source if not source_is_local else 'localhost'} → {dest if not dest_is_local else 'localhost'}")
+    print(f"\nOn the destination, run:")
+    print(f"  hermes gateway restart")
+    print(f"{'=' * 60}")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 # Command-line interface using argparse with subcommands.
 # Each subcommand maps directly to a top-level function:
-#   export → export_config()    import → import_config()
-#   list   → list_archive()     diff   → diff_archive()
+#   export  → export_config()    import  → import_config()
+#   list    → list_archive()     diff    → diff_archive()
+#   migrate → migrate_config()
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -875,14 +1295,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  hermes-migrate export                           # Export full config
-  hermes-migrate export --redact-secrets          # Export with API keys redacted
-  hermes-migrate export -o backup.tar.gz          # Custom output path
-  hermes-migrate import backup.tar.gz             # Import to current host
-  hermes-migrate import backup.tar.gz --dry-run   # Preview what would happen
-  hermes-migrate import backup.tar.gz --force     # Overwrite conflicts
-  hermes-migrate list backup.tar.gz               # List archive contents
-  hermes-migrate diff backup.tar.gz               # Compare archive vs current
+  hermes-migrate export                                    # Export full config
+  hermes-migrate export --redact-secrets                   # Export with API keys redacted
+  hermes-migrate export -o backup.tar.gz                   # Custom output path
+  hermes-migrate import backup.tar.gz                      # Import to current host
+  hermes-migrate import backup.tar.gz --dry-run            # Preview what would happen
+  hermes-migrate import backup.tar.gz --force              # Overwrite conflicts
+  hermes-migrate list backup.tar.gz                        # List archive contents
+  hermes-migrate diff backup.tar.gz                        # Compare archive vs current
+  hermes-migrate migrate --source user@host1 --dest user@host2   # Host-to-host migration
         """,
     )
     parser.add_argument(
@@ -943,6 +1364,39 @@ Examples:
         help=f"Target Hermes home to compare against (default: {get_hermes_home()})",
     )
 
+    # ── migrate ────────────────────────────────────────────────────────────
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="One-command host-to-host migration over SSH",
+    )
+    p_migrate.add_argument(
+        "-s", "--source",
+        help="Source host (user@host). Omit if running on source host.",
+    )
+    p_migrate.add_argument(
+        "-d", "--dest",
+        help="Destination host (user@host). Omit if running on destination host.",
+    )
+    p_migrate.add_argument(
+        "-i", "--install",
+        action="store_true",
+        help="Auto-install Hermes on destination if missing (skip prompt)",
+    )
+    p_migrate.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact API keys/secrets during transfer",
+    )
+    p_migrate.add_argument(
+        "--no-profiles",
+        action="store_true",
+        help="Exclude named profiles from migration",
+    )
+    p_migrate.add_argument(
+        "--target-home",
+        help="Target Hermes home on destination (default: ~/.hermes)",
+    )
+
     # ── Parse and dispatch ───────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -968,6 +1422,15 @@ Examples:
         list_archive(args.archive)
     elif args.command == "diff":
         diff_archive(args.archive, target_home=args.target_home)
+    elif args.command == "migrate":
+        migrate_config(
+            source=args.source,
+            dest=args.dest,
+            install=args.install,
+            redact_secrets=args.redact_secrets,
+            no_profiles=args.no_profiles,
+            target_home=args.target_home,
+        )
 
 
 if __name__ == "__main__":
