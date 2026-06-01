@@ -1,4 +1,4 @@
-# Hermes Migrate v1.2.0
+# Hermes Migrate v1.3.0
 
 Export/import a complete Hermes Agent configuration between hosts.
 
@@ -112,14 +112,15 @@ python3 hermes_migrate.py migrate -s SOURCE -d DEST [options]
 ```
 
 One-command host-to-host migration over SSH. Exports from the source, transfers
-the archive via scp, and imports on the destination. Can be run from the source,
-the destination, or a third host.
+the archive via rsync (with progress) or scp, and imports on the destination.
+Can be run from the source, the destination, or a third host.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-s, --source HOST` | — | Source host (user@host). Omit if running on source. |
 | `-d, --dest HOST` | — | Destination host (user@host). Omit if running on dest. |
 | `-i, --install` | off | Auto-install Hermes on dest if missing (skip prompt) |
+| `-v, --verbose` | off | Show progress bars + print post-migration report |
 | `--redact-secrets` | off | Redact API keys during transfer |
 | `--no-profiles` | off | Exclude named profiles |
 | `--target-home PATH` | `~/.hermes` | Target Hermes home on destination |
@@ -128,21 +129,31 @@ If Hermes is not installed on the destination, the tool prompts to install it
 (use `-i` to auto-install without prompting). SSH key authentication is
 required — password prompts are forwarded to the terminal.
 
+**Progress & reporting:** Use `-v` / `--verbose` for a live progress bar during
+compression and a structured post-migration report showing:
+- Source → destination recap with duration
+- Breakdown of what was migrated (config files, skills, cron, memories, etc.)
+- What was excluded and why (caches, runtime state, logs, etc.)
+- Archive size and file counts
+
+**Transfer:** The tool prefers `rsync --progress` for transfers (shows transfer
+speed and ETA). Falls back to `scp` if rsync is unavailable.
+
 ```bash
 # Run from source host (only --dest needed)
-python3 hermes_migrate.py migrate -d user@new-server
+python3 hermes_migrate.py migrate -d user@new-server -v
 
 # Run from destination host (only --source needed)
-python3 hermes_migrate.py migrate -s user@old-server
+python3 hermes_migrate.py migrate -s user@old-server -v
 
 # Run from a third host (both required)
-python3 hermes_migrate.py migrate -s user@host1 -d user@host2
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2 -v
 
 # Auto-install Hermes on destination if missing
-python3 hermes_migrate.py migrate -s user@host1 -d user@host2 -i
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2 -i -v
 
 # With redacted secrets (safer over untrusted networks)
-python3 hermes_migrate.py migrate -s user@host1 -d user@host2 --redact-secrets
+python3 hermes_migrate.py migrate -s user@host1 -d user@host2 --redact-secrets -v
 ```
 
 ## Security
@@ -211,6 +222,7 @@ python3 hermes_migrate.py export --redact-secrets -o shared-config.tar.gz
 
 - Python 3.10+ (stdlib only — no pip install needed)
 - tar (available on all Linux/macOS)
+- rsync (optional — enables progress bars during transfer; falls back to scp)
 
 ## What Migration Does and Doesn't Transfer
 

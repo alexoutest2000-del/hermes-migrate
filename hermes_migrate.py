@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -164,6 +164,43 @@ def get_export_name() -> str:
     return f"hermes-export-{hostname}-{date_str}.tar.gz"
 
 
+# ── Terminal display helpers ──────────────────────────────────────────────
+# Minimal stdlib progress bar and spinner — no external dependencies.
+# These provide visual feedback during long-running operations (export
+# compression, scp transfers) without pulling in tqdm or other libraries.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _progress_bar(current: int, total: int, label: str = "Progress", width: int = 30) -> str:
+    """Render a single-line ASCII progress bar.
+
+    Parameters:
+        current - How many items have been processed.
+        total   - Total number of items to process.
+        label   - Left-hand label text.
+        width   - Width of the bar in characters (not including label/brackets).
+
+    Returns a string like: "Exporting [████████░░░░░░░░░░░░] 42% (263/629)"
+    The caller is responsible for using \\r to overwrite the line.
+    """
+    if total == 0:
+        pct = 100
+    else:
+        pct = min(100, int(current / total * 100))
+    filled = int(width * current / total) if total > 0 else width
+    bar = "█" * filled + "░" * (width - filled)
+    return f"\r{label} [{bar}] {pct}% ({current}/{total})"
+
+
+def _spinner_frame(idx: int) -> str:
+    """Return a single spinner frame character (braille-based).
+
+    Cycles through: ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+    Use with \\r to animate in-place.
+    """
+    frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    return frames[idx % len(frames)]
+
+
 # ── Export ───────────────────────────────────────────────────────────────────
 # The export pipeline has three stages:
 #   1. MANIFEST BUILDING  — decide which files to include (build_export_manifest)
@@ -176,7 +213,8 @@ def export_config(
     redact_secrets: bool = False,
     include_profiles: bool = True,
     hermes_home: Optional[Path] = None,
-) -> Path:
+    verbose: bool = False,
+) -> tuple[Path, dict]:
     """
     Package Hermes configuration into a portable tar.gz archive.
 
@@ -185,8 +223,12 @@ def export_config(
         redact_secrets  - If True, replace API keys with [REDACTED] in .env files
         include_profiles- If False, skip named profiles under HERMES_HOME/profiles/
         hermes_home     - Override the Hermes home directory (uses HERMES_HOME env or ~/.hermes)
+        verbose         - If True, show a progress bar during compression
+                          and return summary stats for post-migration reporting.
 
-    Returns the path to the created archive.
+    Returns a tuple of (archive_path, summary_dict) where summary_dict contains
+    counts by category (config_files, skills, cron, memories, plugins, profiles,
+    misc) and the total size — used by migrate_config for the post-migration report.
     """
     hermes_home = hermes_home or get_hermes_home()
 
@@ -213,7 +255,7 @@ def export_config(
         print("ERROR: No Hermes configuration files found to export.")
         sys.exit(1)
 
-    print(f"\nExporting {len(manifest)} items:")
+    print(f"\\nExporting {len(manifest)} items:")
 
     # ── Compute archive paths ────────────────────────────────────────────
     # Archive paths are relative to hermes_home.parent so they unpack as
@@ -228,6 +270,11 @@ def export_config(
         print(f"  {arcname}  ({_human_size(size)})")
         archive_members.append((src_path, str(arcname)))
 
+    # ── Compute category breakdown for reporting ─────────────────────────
+    # Categorize every manifest entry so the post-migration report can show
+    # what was migrated and what was excluded.
+    summary = _compute_export_summary(manifest, hermes_home, include_profiles)
+
     # ── Build metadata manifest ──────────────────────────────────────────
     # Embedded in the archive as .hermes-migrate-manifest.json so the
     # import side can validate, show metadata, and warn about redacted exports.
@@ -241,7 +288,10 @@ def export_config(
     }
 
     # ── Stage 2: Write the tar.gz archive ────────────────────────────────
-    print("\nCompressing...")
+    total_files = len(archive_members)
+    print(f"\nCompressing {total_files} entries...")
+    last_pct = -1
+
     with tarfile.open(output_path, "w:gz") as tar:
         # Write the manifest as the very first entry (easy to find and parse)
         manifest_json = json.dumps(manifest_data, indent=2).encode("utf-8")
@@ -249,7 +299,21 @@ def export_config(
         info.size = len(manifest_json)
         tar.addfile(info, io.BytesIO(manifest_json))
 
-        for src_path, arcname in archive_members:
+        for idx, (src_path, arcname) in enumerate(archive_members):
+            # ── Progress indicator ────────────────────────────────────
+            # In verbose mode, show a progress bar every 1% change.
+            # In quiet mode, show a simple spinner so the user knows it's working.
+            if verbose:
+                new_pct = int((idx + 1) / total_files * 100)
+                if new_pct != last_pct:
+                    sys.stderr.write(_progress_bar(idx + 1, total_files, "Compressing"))
+                    sys.stderr.flush()
+                    last_pct = new_pct
+            elif (idx + 1) % 50 == 0 or idx == total_files - 1:
+                # Show a count marker every 50 entries in non-verbose mode
+                sys.stderr.write(f"\r  {_spinner_frame(idx)} {idx + 1}/{total_files} entries packed...")
+                sys.stderr.flush()
+
             if src_path.is_file():
                 content = src_path.read_bytes()
 
@@ -279,8 +343,16 @@ def export_config(
                 # Directories — add recursively
                 tar.add(src_path, arcname=arcname, recursive=True)
 
+    # Finalize the progress line
+    if verbose:
+        sys.stderr.write(_progress_bar(total_files, total_files, "Compressing") + "\n")
+        sys.stderr.flush()
+    else:
+        sys.stderr.write("\r  " + " " * 50 + "\r")  # clear the spinner line
+        sys.stderr.flush()
+
     archive_size = output_path.stat().st_size
-    print(f"\nDone: {output_path} ({_human_size(archive_size)}")
+    print(f"\nDone: {output_path} ({_human_size(archive_size)})")
 
     # ── Security warning for non-redacted exports ────────────────────────
     if not redact_secrets:
@@ -288,7 +360,9 @@ def export_config(
         print("This export CONTAINS your API keys and secrets (.env, auth.json).")
         print("Transfer it securely. Use --redact-secrets to strip them out.")
 
-    return output_path
+    summary["archive_size_bytes"] = archive_size
+    summary["archive_size_human"] = _human_size(archive_size)
+    return output_path, summary
 
 
 def build_export_manifest(hermes_home: Path, include_profiles: bool) -> list[Path]:
@@ -353,6 +427,141 @@ def build_export_manifest(hermes_home: Path, include_profiles: bool) -> list[Pat
             manifest.append(entry)
 
     return manifest
+
+
+def _compute_export_summary(
+    manifest: list[Path],
+    hermes_home: Path,
+    include_profiles: bool,
+) -> dict:
+    """Compute a categorized summary of the export for post-migration reporting.
+
+    Counts files by category (config, skills, cron, memories, plugins,
+    profiles, misc) and records what was explicitly excluded and why.
+    Returns a dict suitable for feeding into _print_migration_report().
+
+    Parameters:
+        manifest         - The full list of Paths being exported.
+        hermes_home      - Hermes home directory (used for relative paths).
+        include_profiles - Whether profiles were included.
+
+    Returns a dict with keys:
+        categories: {label: count, ...}
+        excluded:   {reason: count, ...}
+        total_items: int
+        total_files: int
+    """
+    # ── Categorize every manifest entry ──────────────────────────────────
+    categories: dict[str, int] = {}
+    file_count = 0
+
+    for entry in manifest:
+        # Determine the top-level category from the relative path
+        try:
+            rel = entry.relative_to(hermes_home)
+        except ValueError:
+            # Entry is outside hermes_home (unlikely but defensive)
+            categories.setdefault("misc", 0)
+            categories["misc"] += 1
+            if entry.is_file():
+                file_count += 1
+            continue
+
+        parts = rel.parts
+        if len(parts) == 1 and parts[0] in CONFIG_FILES:
+            cat = "config"
+        elif parts[0] == "skills":
+            cat = "skills"
+        elif parts[0] == "cron":
+            cat = "cron"
+        elif parts[0] == "memories":
+            cat = "memories"
+        elif parts[0] == "plugins":
+            cat = "plugins"
+        elif parts[0] == "profiles":
+            cat = "profiles"
+        else:
+            cat = "misc"
+
+        categories[cat] = categories.get(cat, 0) + 1
+        if entry.is_file():
+            file_count += 1
+        elif entry.is_dir():
+            # Count all files inside the directory
+            file_count += sum(1 for f in entry.rglob("*") if f.is_file())
+
+    # ── Compute exclusion summary ────────────────────────────────────────
+    # Counts what's excluded and why, for transparency in the report.
+    excluded: dict[str, int] = {}
+
+    # Top-level exclusions
+    for entry in sorted(hermes_home.iterdir()):
+        if entry.name.startswith(".") and entry.name not in (".env",):
+            continue
+        if entry.name in CONFIG_FILES or entry.name in CONFIG_DIRS:
+            continue
+        if entry.name == "profiles" and include_profiles:
+            continue
+        if _should_exclude_top_level(entry.name):
+            reason = _classify_exclusion(entry.name)
+            excluded[reason] = excluded.get(reason, 0) + 1
+
+    if not include_profiles:
+        profiles_dir = hermes_home / "profiles"
+        if profiles_dir.exists():
+            excluded["profiles (--no-profiles)"] = sum(
+                1 for _ in profiles_dir.iterdir()
+            )
+
+    return {
+        "categories": categories,
+        "excluded": excluded,
+        "total_items": len(manifest),
+        "total_files": file_count,
+    }
+
+
+def _classify_exclusion(name: str) -> str:
+    """Classify an excluded entry into a human-readable reason.
+
+    Maps excluded filenames/directories to buckets like "runtime state",
+    "caches", "logs", etc. for the post-migration report.
+
+    Parameters:
+        name - The filename or directory name being excluded.
+
+    Returns a label string (e.g., "session/state data", "caches").
+    """
+    # ── Session, state, and database files ──
+    if name in ("sessions", "state.db", "state.db-shm", "state.db-wal",
+                 "state-snapshots", "kanban.db", "kanban.db-shm",
+                 "kanban.db-wal"):
+        return "session/state data"
+    # ── Gateway and process runtime ──
+    if name in ("gateway.pid", "gateway.lock", "gateway_state.json",
+                 "processes.json", "auth.lock", "shell-hooks-allowlist.json"):
+        return "runtime locks & state"
+    # ── Caches ──
+    if name in ("cache", "audio_cache", "image_cache", "images",
+                 "models_dev_cache.json", "ollama_cloud_models_cache.json"):
+        return "caches"
+    # ── Logs and history ──
+    if name in ("logs", ".hermes_history", "interrupt_debug.log"):
+        return "logs & history"
+    # ── Sandboxes and checkpoints ──
+    if name in ("checkpoints", "sandboxes"):
+        return "sandboxes/workspaces"
+    # ── Infrastructure (not portable) ──
+    if name in ("hermes-agent", "lsp", "bin", "hooks", "pairing"):
+        return "infrastructure (machine-specific)"
+    # ── Install markers ──
+    if name == ".install_method":
+        return "install metadata"
+    # ── Backup files ──
+    if "bak" in name:
+        return "backup files"
+    # Fallback for anything else in TOP_LEVEL_EXCLUDE
+    return "other excluded"
 
 
 def _add_dir_contents(
@@ -956,24 +1165,68 @@ def _scp_transfer(
     source: str,
     dest: str,
     timeout: int = 300,
+    show_progress: bool = False,
 ) -> None:
-    """Copy a file between hosts (or locally) via scp.
+    """Copy a file between hosts (or locally) via rsync or scp.
+
+    Prefers rsync --progress (shows transfer speed + ETA) over plain scp
+    when both source and dest involve a remote host. Falls back to scp
+    if rsync is unavailable. For local transfers, uses cp.
 
     Parameters:
-        source - Source path, optionally prefixed with host: (e.g., 'host:/tmp/x.tar.gz')
-        dest   - Destination path, optionally prefixed with host:
-        timeout- Max seconds to wait.
-
-    For local transfers (no host prefix on either side), uses cp instead of scp.
+        source        - Source path, optionally prefixed with host:
+                        (e.g., 'host:/tmp/x.tar.gz')
+        dest          - Destination path, optionally prefixed with host:
+        timeout       - Max seconds to wait.
+        show_progress - If True, pass --progress to rsync for live feedback.
     """
-    # Check if this is a local-to-local copy
+    # ── Local-to-local: use cp ───────────────────────────────────────────
     if ":" not in source and ":" not in dest:
         print(f"  cp {source} → {dest}")
         subprocess.run(["cp", source, dest], check=True, timeout=timeout)
         return
 
+    # ── Remote transfer: try rsync first for progress bar ────────────────
+    # rsync --progress shows: filename, percentage, transfer speed, ETA.
+    # This is vastly more informative than silent scp for migrations.
+    rsync_available = False
+    try:
+        subprocess.run(
+            ["rsync", "--version"],
+            capture_output=True,
+            timeout=5,
+        )
+        rsync_available = True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    if rsync_available:
+        # Build rsync args: -a (archive), -v (verbose), --progress,
+        # -e with SSH options for host key handling.
+        ssh_opts = " ".join(_ssh_base_args(
+            source if ":" in source else dest
+        ))
+        rsync_args = [
+            "rsync", "-av", "--progress",
+            "-e", f"ssh {ssh_opts}",
+            source, dest,
+        ]
+        print(f"  rsync {source} → {dest}")
+        try:
+            subprocess.run(rsync_args, check=True, timeout=timeout)
+            print()  # newline after rsync progress output
+            return
+        except subprocess.CalledProcessError as e:
+            # rsync failed — fall back to scp
+            print(f"  (rsync failed: {e}, falling back to scp)")
+        except subprocess.TimeoutExpired:
+            print(f"ERROR: rsync transfer timed out after {timeout}s")
+            sys.exit(1)
+    else:
+        print("  (rsync not available, using scp)")
+
+    # ── Fallback: use scp ────────────────────────────────────────────────
     scp_args = _ssh_base_args(source if ":" in source else dest)
-    # scp needs args before the host:path specs
     print(f"  scp {source} → {dest}")
     try:
         subprocess.run(
@@ -1141,6 +1394,93 @@ def _install_hermes(host: str, auto_install: bool = False) -> bool:
     return True
 
 
+def _print_migration_report(
+    source_label: str,
+    dest_label: str,
+    summary: dict,
+    archive_name: str,
+    started_at: datetime,
+    redacted: bool,
+) -> None:
+    """Print a structured post-migration summary report.
+
+    Displays a categorized breakdown of what was migrated (config files,
+    skills, cron jobs, memories, plugins, profiles, misc), what was
+    explicitly excluded and why, archive size, and timing.
+
+    Parameters:
+        source_label - Human-readable source host (e.g., "user@host1" or "localhost")
+        dest_label   - Human-readable destination host
+        summary      - Dict from _compute_export_summary() with categories,
+                       excluded items, and counts
+        archive_name - The archive filename
+        started_at   - When the migration began (for elapsed time)
+        redacted     - Whether secrets were redacted
+    """
+    elapsed = datetime.now() - started_at
+    elapsed_str = f"{int(elapsed.total_seconds())}s"
+    if elapsed.total_seconds() > 60:
+        mins = int(elapsed.total_seconds() // 60)
+        secs = int(elapsed.total_seconds() % 60)
+        elapsed_str = f"{mins}m {secs}s"
+
+    width = 60
+    print()
+    print("╔" + "═" * (width - 2) + "╗")
+    print("║" + " MIGRATION REPORT ".center(width - 2) + "║")
+    print("╠" + "═" * (width - 2) + "╣")
+
+    # ── Header: source → dest ────────────────────────────────────────────
+    print(f"║  Source:       {source_label:<{width - 17}}║")
+    print(f"║  Destination:  {dest_label:<{width - 17}}║")
+    print(f"║  Archive:      {archive_name:<{width - 17}}║")
+    print(f"║  Duration:     {elapsed_str:<{width - 17}}║")
+    if redacted:
+        print(f"║  Secrets:      REDACTED{' ' * (width - 24)}║")
+    print("╠" + "═" * (width - 2) + "╣")
+
+    # ── What was migrated ────────────────────────────────────────────────
+    print("║" + " MIGRATED ".center(width - 2) + "║")
+    print("╠" + "─" * (width - 2) + "╣")
+
+    categories = summary.get("categories", {})
+    cat_labels = [
+        ("config", "Config files (config.yaml, .env, auth, etc.)"),
+        ("skills", "Skills"),
+        ("cron", "Cron jobs"),
+        ("memories", "Memories"),
+        ("plugins", "Plugins"),
+        ("profiles", "Profiles"),
+        ("misc", "Miscellaneous"),
+    ]
+    for cat, label in cat_labels:
+        count = categories.get(cat, 0)
+        if count > 0:
+            print(f"║  {label:<45} {count:>4} items ║")
+
+    total_items = summary.get("total_items", 0)
+    total_files = summary.get("total_files", 0)
+    archive_size = summary.get("archive_size_human", "?")
+    print("╠" + "─" * (width - 2) + "╣")
+    print(f"║  {'Total manifest entries':<45} {total_items:>4} items ║")
+    print(f"║  {'Total files packed':<45} {total_files:>4} files ║")
+    print(f"║  {'Archive size':<45} {archive_size:>4}     ║")
+
+    # ── What was NOT migrated ────────────────────────────────────────────
+    excluded = summary.get("excluded", {})
+    if excluded:
+        print("╠" + "═" * (width - 2) + "╣")
+        print("║" + " EXCLUDED (not portable) ".center(width - 2) + "║")
+        print("╠" + "─" * (width - 2) + "╣")
+        for reason, count in sorted(excluded.items()):
+            print(f"║  {reason:<45} {count:>4} items ║")
+
+    print("╠" + "═" * (width - 2) + "╣")
+    print(f"║  {'Next: run `hermes gateway restart` on destination':<{width - 6}}║")
+    print("╚" + "═" * (width - 2) + "╝")
+    print()
+
+
 def migrate_config(
     source: Optional[str] = None,
     dest: Optional[str] = None,
@@ -1148,13 +1488,14 @@ def migrate_config(
     redact_secrets: bool = False,
     no_profiles: bool = False,
     target_home: Optional[str] = None,
+    verbose: bool = False,
 ) -> None:
     """One-command migration from source host to destination host over SSH.
 
     Can be run from the source, the destination, or a third host. The tool
     exports Hermes config from the source, transfers the archive to the
-    destination via scp, and imports it. If Hermes is not installed on the
-    destination, it offers to install it (or auto-installs with --install).
+    destination via scp/rsync, and imports it. If Hermes is not installed on
+    the destination, it offers to install it (or auto-installs with --install).
 
     Parameters:
         source         - Source host (user@host or None for localhost).
@@ -1162,15 +1503,21 @@ def migrate_config(
         install        - Auto-install Hermes on dest if missing (skip prompt).
         redact_secrets - Redact API keys during transfer.
         no_profiles    - Exclude named profiles from migration.
+        target_home    - Custom Hermes home on destination.
+        verbose        - Show progress bars and print post-migration report.
 
     At least one of source/dest must be remote for this to be useful;
     if both are local, falls back to a local export-then-import.
     """
     source = source or ""
     dest = dest or ""
+    started_at = datetime.now()
 
     source_is_local = _is_localhost(source)
     dest_is_local = _is_localhost(dest)
+
+    source_label = "localhost" if source_is_local else source
+    dest_label = "localhost" if dest_is_local else dest
 
     # ── Validate ─────────────────────────────────────────────────────────
     if not source and not dest:
@@ -1180,8 +1527,8 @@ def migrate_config(
 
     print("=" * 60)
     print("Hermes Migration")
-    print(f"  Source:      {'localhost' if source_is_local else source}")
-    print(f"  Destination: {'localhost' if dest_is_local else dest}")
+    print(f"  Source:      {source_label}")
+    print(f"  Destination: {dest_label}")
     print(f"  Running from: {'source' if source_is_local else 'destination' if dest_is_local else 'third host'}")
     print("=" * 60)
 
@@ -1202,38 +1549,44 @@ def migrate_config(
     archive_name = f"hermes-migrate-{os.uname().nodename}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
     source_archive = f"/tmp/{archive_name}"
 
+    # summary dict holds category counts for the post-migration report
+    summary: dict = {}
+
     if source_is_local:
         print(f"\nExporting from localhost...")
-        export_config(
+        _, summary = export_config(
             output_path=source_archive,
             redact_secrets=redact_secrets,
             include_profiles=not no_profiles,
+            verbose=verbose,
         )
     else:
         _remote_export(source, source_archive, redact_secrets, no_profiles)
+        # Remote exports don't return a summary; we extract it from the
+        # archive later via list_archive, or build a minimal one.
+        summary = {"categories": {}, "excluded": {}, "total_items": 0, "total_files": 0}
 
     # ── 2. Transfer archive to destination ───────────────────────────────
     dest_archive = f"/tmp/{archive_name}"
 
     if source_is_local and dest_is_local:
         # Both local — archive is already in place, no transfer needed
-        # (But use the correct path: source_archive and dest_archive are the same)
         pass
     elif source_is_local:
         # Source local, dest remote
         print(f"\nTransferring archive to {dest}...")
-        _scp_transfer(source_archive, f"{dest}:{dest_archive}", timeout=120)
+        _scp_transfer(source_archive, f"{dest}:{dest_archive}", timeout=300)
     elif dest_is_local:
         # Source remote, dest local
         print(f"\nTransferring archive from {source}...")
-        _scp_transfer(f"{source}:{source_archive}", dest_archive, timeout=120)
+        _scp_transfer(f"{source}:{source_archive}", dest_archive, timeout=300)
     else:
-        # Both remote (3rd host) — scp between them
+        # Both remote (3rd host) — rsync/scp between them
         print(f"\nTransferring archive from {source} to {dest}...")
         _scp_transfer(
             f"{source}:{source_archive}",
             f"{dest}:{dest_archive}",
-            timeout=120,
+            timeout=300,
         )
 
     # ── 3. Import on destination ─────────────────────────────────────────
@@ -1268,9 +1621,22 @@ def migrate_config(
             except Exception:
                 pass
 
+    # ── 5. Post-migration report ──────────────────────────────────────────
+    # In verbose mode, print a structured report showing what was migrated
+    # and what was excluded, plus source/dest recap and timing.
+    if verbose and summary.get("total_items", 0) > 0:
+        _print_migration_report(
+            source_label=source_label,
+            dest_label=dest_label,
+            summary=summary,
+            archive_name=archive_name,
+            started_at=started_at,
+            redacted=redact_secrets,
+        )
+
     print(f"\n{'=' * 60}")
     print("Migration complete!")
-    print(f"  {source if not source_is_local else 'localhost'} → {dest if not dest_is_local else 'localhost'}")
+    print(f"  {source_label} → {dest_label}")
     print(f"\nOn the destination, run:")
     print(f"  hermes gateway restart")
     print(f"{'=' * 60}")
@@ -1396,6 +1762,11 @@ Examples:
         "--target-home",
         help="Target Hermes home on destination (default: ~/.hermes)",
     )
+    p_migrate.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show progress bars during transfer and print post-migration report",
+    )
 
     # ── Parse and dispatch ───────────────────────────────────────────────
     args = parser.parse_args()
@@ -1405,6 +1776,7 @@ Examples:
         sys.exit(1)
 
     if args.command == "export":
+        # Standalone export: ignore the summary dict (only needed for migrate)
         export_config(
             output_path=args.output,
             redact_secrets=args.redact_secrets,
@@ -1430,6 +1802,7 @@ Examples:
             redact_secrets=args.redact_secrets,
             no_profiles=args.no_profiles,
             target_home=args.target_home,
+            verbose=args.verbose,
         )
 
 
